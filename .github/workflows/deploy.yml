@@ -40,4 +40,4 @@ jobs:
           target="$DEPLOY_USER@$DEPLOY_HOST"
           scp -i ~/.ssh/deploy_key -P "$DEPLOY_PORT" pride_bot.py "$target:/opt/pride-timetable/pride_bot.py"
           printf '%s\n' "$BOT_ENV" | ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" "$target" 'umask 077; cat > /opt/pride-timetable/.env'
-          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" "$target" 'python3 -m py_compile /opt/pride-timetable/pride_bot.py && sudo /usr/bin/systemctl restart pride-timetable.service && sleep 2 && sudo /usr/bin/systemctl is-active --quiet pride-timetable.service'
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" "$target" 'python3 -m py_compile /opt/pride-timetable/pride_bot.py && sudo /usr/bin/systemctl restart pride-timetable.service && sleep 2 && sudo /usr/bin/systemctl is-active pride-timetable.service'
