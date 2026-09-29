@@ -37,6 +37,7 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
 load_dotenv()
 CLUB_ID = int(os.getenv("PRIDE_CLUB_ID", "6214"))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+OPENING_CHECK_INTERVAL = int(os.getenv("OPENING_CHECK_INTERVAL", "1800"))
 DB_PATH = Path(os.getenv("PRIDE_DB", ROOT / "pride.db"))
 
 
@@ -546,7 +547,7 @@ class PrideBot:
         now_timestamp = int(time.time())
         if now_timestamp < self.next_opening_check:
             return
-        self.next_opening_check = now_timestamp + CHECK_INTERVAL
+        self.next_opening_check = now_timestamp + OPENING_CHECK_INTERVAL
         watches = self.database.execute(
             "SELECT * FROM opening_watches WHERE status='active' ORDER BY username,title"
         ).fetchall()
