@@ -224,6 +224,22 @@ class Telegram:
         markup = {"inline_keyboard": keyboard} if keyboard else None
         return self.call("sendMessage", chat_id=chat_id, text=text, reply_markup=markup)
 
+    def send_main_menu(self, chat_id: int, text: str):
+        return self.call(
+            "sendMessage",
+            chat_id=chat_id,
+            text=text,
+            reply_markup={
+                "keyboard": [
+                    [{"text": "Расписание"}],
+                    [{"text": "Следить за открытием записи"}],
+                    [{"text": "Мои подписки"}],
+                ],
+                "resize_keyboard": True,
+                "is_persistent": True,
+            },
+        )
+
 
 RANGE_KEYBOARD = [
     [{"text": "Сегодня", "callback_data": "range|today|0"}],
@@ -433,13 +449,19 @@ class PrideBot:
     def handle_message(self, message: dict) -> None:
         chat_id, username = self.user({"from": message.get("from"), "message": message})
         text = (message.get("text") or "").strip()
-        if text == "/watches":
+        if text in {"/watches", "Мои подписки"}:
             self.watches(chat_id, username)
-        elif text == "/openings":
+        elif text in {"/openings", "Следить за открытием записи"}:
             self.send_opening_categories(chat_id, username, 0)
+        elif text == "Расписание":
+            self.set_query(chat_id, "")
+            self.send_ranges(chat_id)
         elif text in {"/start", "/all"}:
             self.set_query(chat_id, "")
-            self.telegram.send(chat_id, f"Аккаунт @{username} подключён. Напишите часть названия занятия или выберите период.")
+            self.telegram.send_main_menu(
+                chat_id,
+                f"Аккаунт @{username} подключён. Используйте кнопки меню или напишите часть названия занятия.",
+            )
             self.send_ranges(chat_id)
         elif text.startswith("/"):
             self.telegram.send(chat_id, "Команды: /start, /all, /openings, /watches")
@@ -573,6 +595,16 @@ class PrideBot:
 
     def run(self) -> None:
         offset = 0
+        self.telegram.call(
+            "setMyCommands",
+            commands=[
+                {"command": "start", "description": "Главное меню"},
+                {"command": "openings", "description": "Следить за открытием записи"},
+                {"command": "watches", "description": "Мои подписки"},
+                {"command": "all", "description": "Все занятия"},
+            ],
+        )
+        self.telegram.call("setChatMenuButton", menu_button={"type": "commands"})
         print("Pride bot запущен", flush=True)
         while True:
             self.check_watches()
