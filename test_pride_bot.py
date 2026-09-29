@@ -33,8 +33,8 @@ class PrideBotTest(unittest.TestCase):
             "Шахматный клуб",
             "ШАХМАТЫ",
         )
-        self.assertTrue(all(not pride_bot.opening_category_allowed(title) for title in excluded))
-        self.assertTrue(pride_bot.opening_category_allowed("ЙОГА (90 мин)"))
+        self.assertTrue(all(not pride_bot.class_allowed(title) for title in excluded))
+        self.assertTrue(pride_bot.class_allowed("ЙОГА (90 мин)"))
 
 
 if __name__ == "__main__":

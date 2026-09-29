@@ -137,7 +137,7 @@ def item_name(item: dict) -> str:
     return item.get("activity", {}).get("title", item.get("id", "Занятие"))
 
 
-def opening_category_allowed(title: str) -> bool:
+def class_allowed(title: str) -> bool:
     return "шахмат" not in title.casefold() and not AGE_IN_TITLE.search(title)
 
 
@@ -298,6 +298,7 @@ class PrideBot:
     def send_schedule(self, chat_id: int, username: str, mode: str, page: int) -> None:
         start, days = range_dates(mode)
         items = MobiFitness(account_token(username)).schedule(start, days)
+        items = [item for item in items if class_allowed(item_name(item))]
         query = self.query(chat_id).casefold()
         if query:
             items = [item for item in items if query in item_name(item).casefold()]
@@ -327,7 +328,7 @@ class PrideBot:
         for item in items:
             activity = item.get("activity", {})
             title = item_name(item)
-            if item.get("preEntry") and activity.get("id") and opening_category_allowed(title):
+            if item.get("preEntry") and activity.get("id") and class_allowed(title):
                 categories.setdefault(title.casefold(), (activity["id"], title))
         return sorted(categories.values(), key=lambda category: category[1].casefold())
 
