@@ -1,0 +1,5 @@
+.env
+.secrets/
+pride.db
+__pycache__/
+
