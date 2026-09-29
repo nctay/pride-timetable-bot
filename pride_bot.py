@@ -21,6 +21,10 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parent
 API_URL = "https://mobifitness.ru/api/v8"
 MOSCOW = ZoneInfo("Europe/Moscow")
+AGE_IN_TITLE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:(?:[-–—]|до)\s*\d+(?:[.,]\d+)?|\+)?\s*(?:лет|год(?:а|ов)?)",
+    re.IGNORECASE,
+)
 
 
 def load_dotenv(path: Path = ROOT / ".env") -> None:
@@ -131,6 +135,10 @@ def slots(item: dict) -> int | None:
 
 def item_name(item: dict) -> str:
     return item.get("activity", {}).get("title", item.get("id", "Занятие"))
+
+
+def opening_category_allowed(title: str) -> bool:
+    return "шахмат" not in title.casefold() and not AGE_IN_TITLE.search(title)
 
 
 def local_datetime(value: str) -> datetime:
@@ -319,7 +327,7 @@ class PrideBot:
         for item in items:
             activity = item.get("activity", {})
             title = item_name(item)
-            if item.get("preEntry") and activity.get("id"):
+            if item.get("preEntry") and activity.get("id") and opening_category_allowed(title):
                 categories.setdefault(title.casefold(), (activity["id"], title))
         return sorted(categories.values(), key=lambda category: category[1].casefold())
 
