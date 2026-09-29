@@ -163,6 +163,11 @@ def range_dates(mode: str, today: date | None = None) -> tuple[date, int]:
     raise ValueError(mode)
 
 
+def selectable_dates(today: date | None = None) -> list[date]:
+    today = today or datetime.now(MOSCOW).date()
+    return [today + timedelta(days=offset) for offset in range(14)]
+
+
 def watch_deadline_reached(starts_at: str, now: datetime | None = None) -> bool:
     return (now or datetime.now(MOSCOW)) >= local_datetime(starts_at) - timedelta(minutes=15)
 
@@ -253,7 +258,7 @@ class Telegram:
 RANGE_KEYBOARD = [
     [{"text": "Сегодня", "callback_data": "range|today|0"}],
     [{"text": "Завтра", "callback_data": "range|tomorrow|0"}],
-    [{"text": "Ближайшие 7 дней", "callback_data": "range|week|0"}],
+    [{"text": "Выбрать дату", "callback_data": "dates|0"}],
     [{"text": "Следить за открытием записи", "callback_data": "openings|0"}],
     [{"text": "Мои подписки", "callback_data": "subscriptions|0"}],
 ]
@@ -296,7 +301,12 @@ class PrideBot:
         return int(chat_id), username
 
     def send_schedule(self, chat_id: int, username: str, mode: str, page: int) -> None:
-        start, days = range_dates(mode)
+        if mode in {"today", "tomorrow", "week"}:
+            start, days = range_dates(mode)
+            callback_action = "range"
+        else:
+            start, days = date.fromisoformat(mode), 1
+            callback_action = "date"
         items = MobiFitness(account_token(username)).schedule(start, days)
         items = [item for item in items if class_allowed(item_name(item))]
         query = self.query(chat_id).casefold()
@@ -314,13 +324,22 @@ class PrideBot:
             keyboard.append([{"text": label, "callback_data": f"watch|{item['id']}"}])
         navigation = []
         if page:
-            navigation.append({"text": "←", "callback_data": f"range|{mode}|{page - 1}"})
+            navigation.append({"text": "←", "callback_data": f"{callback_action}|{mode}|{page - 1}"})
         if page + 1 < pages:
-            navigation.append({"text": "→", "callback_data": f"range|{mode}|{page + 1}"})
+            navigation.append({"text": "→", "callback_data": f"{callback_action}|{mode}|{page + 1}"})
         if navigation:
             keyboard.append(navigation)
         text = f"Найдено занятий: {len(items)}. Страница {page + 1}/{pages}. Выберите занятие:"
         self.telegram.send(chat_id, text if items else "Подходящих занятий нет.", keyboard or None)
+
+    def send_dates(self, chat_id: int) -> None:
+        weekdays = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+        buttons = [
+            {"text": f"{weekdays[day.weekday()]} {day:%d.%m}", "callback_data": f"date|{day.isoformat()}|0"}
+            for day in selectable_dates()
+        ]
+        keyboard = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+        self.telegram.send(chat_id, "Выберите дату в ближайшие 14 дней:", keyboard)
 
     def opening_categories(self, username: str) -> list[tuple[str, str]]:
         items = MobiFitness(account_token(username)).schedule(datetime.now(MOSCOW).date(), 7)
@@ -484,6 +503,10 @@ class PrideBot:
         self.telegram.call("answerCallbackQuery", callback_query_id=callback["id"])
         action, value, *rest = callback.get("data", "").split("|")
         if action == "range":
+            self.send_schedule(chat_id, username, value, int(rest[0]))
+        elif action == "dates":
+            self.send_dates(chat_id)
+        elif action == "date":
             self.send_schedule(chat_id, username, value, int(rest[0]))
         elif action == "openings":
             self.send_opening_categories(chat_id, username, int(value))
