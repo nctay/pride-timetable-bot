@@ -132,8 +132,15 @@ def item_name(item: dict) -> str:
     return item.get("activity", {}).get("title", item.get("id", "Занятие"))
 
 
+def local_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=MOSCOW)
+    return parsed.astimezone(MOSCOW)
+
+
 def item_time(item: dict) -> str:
-    return datetime.fromisoformat(item["datetime"]).astimezone(MOSCOW).strftime("%d.%m %H:%M")
+    return local_datetime(item["datetime"]).strftime("%d.%m %H:%M")
 
 
 def range_dates(mode: str, today: date | None = None) -> tuple[date, int]:
@@ -148,10 +155,11 @@ def range_dates(mode: str, today: date | None = None) -> tuple[date, int]:
 
 
 def watch_deadline_reached(starts_at: str, now: datetime | None = None) -> bool:
-    start = datetime.fromisoformat(starts_at)
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=MOSCOW)
-    return (now or datetime.now(MOSCOW)) >= start.astimezone(MOSCOW) - timedelta(minutes=15)
+    return (now or datetime.now(MOSCOW)) >= local_datetime(starts_at) - timedelta(minutes=15)
+
+
+def registration_opened(item: dict, now: datetime | None = None) -> bool:
+    return bool(item.get("beginDate")) and (now or datetime.now(MOSCOW)) >= local_datetime(item["beginDate"])
 
 
 def db() -> sqlite3.Connection:
@@ -172,6 +180,23 @@ def db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS filters (
             chat_id INTEGER PRIMARY KEY,
             query TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS opening_watches (
+            chat_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            activity_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            PRIMARY KEY (username, title)
+        );
+        CREATE TABLE IF NOT EXISTS opening_events (
+            username TEXT NOT NULL,
+            title TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            starts_at TEXT NOT NULL,
+            opens_at TEXT NOT NULL,
+            notified INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (username, event_id)
         );
         """
     )
@@ -204,6 +229,7 @@ RANGE_KEYBOARD = [
     [{"text": "Сегодня", "callback_data": "range|today|0"}],
     [{"text": "Завтра", "callback_data": "range|tomorrow|0"}],
     [{"text": "Ближайшие 7 дней", "callback_data": "range|week|0"}],
+    [{"text": "Следить за открытием записи", "callback_data": "openings|0"}],
 ]
 
 
@@ -216,6 +242,7 @@ class PrideBot:
             raise SystemExit("Не задан TELEGRAM_BOT_TOKEN")
         self.telegram = Telegram(token)
         self.database = db()
+        self.next_opening_check = 0
 
     def query(self, chat_id: int) -> str:
         row = self.database.execute("SELECT query FROM filters WHERE chat_id=?", (chat_id,)).fetchone()
@@ -268,6 +295,83 @@ class PrideBot:
         text = f"Найдено занятий: {len(items)}. Страница {page + 1}/{pages}. Выберите занятие:"
         self.telegram.send(chat_id, text if items else "Подходящих занятий нет.", keyboard or None)
 
+    def opening_categories(self, username: str) -> list[tuple[str, str]]:
+        items = MobiFitness(account_token(username)).schedule(datetime.now(MOSCOW).date(), 7)
+        categories: dict[str, tuple[str, str]] = {}
+        for item in items:
+            activity = item.get("activity", {})
+            title = item_name(item)
+            if item.get("preEntry") and activity.get("id"):
+                categories.setdefault(title.casefold(), (activity["id"], title))
+        return sorted(categories.values(), key=lambda category: category[1].casefold())
+
+    def send_opening_categories(self, chat_id: int, username: str, page: int) -> None:
+        categories = self.opening_categories(username)
+        pages = max(1, (len(categories) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = min(max(page, 0), pages - 1)
+        shown = categories[page * self.PAGE_SIZE : (page + 1) * self.PAGE_SIZE]
+        keyboard = [
+            [{"text": title[:64], "callback_data": f"opening|{activity_id}"}]
+            for activity_id, title in shown
+        ]
+        navigation = []
+        if page:
+            navigation.append({"text": "←", "callback_data": f"openings|{page - 1}"})
+        if page + 1 < pages:
+            navigation.append({"text": "→", "callback_data": f"openings|{page + 1}"})
+        if navigation:
+            keyboard.append(navigation)
+        text = f"Виды занятий на ближайшие 7 дней: {len(categories)}. Страница {page + 1}/{pages}."
+        self.telegram.send(chat_id, text, keyboard or None)
+
+    def sync_opening_events(
+        self, username: str, title: str, api: MobiFitness, items: list[dict], suppress_open: bool = False
+    ) -> None:
+        now = datetime.now(MOSCOW)
+        known = {
+            row["event_id"]
+            for row in self.database.execute("SELECT event_id FROM opening_events WHERE username=?", (username,))
+        }
+        for item in items:
+            if item["id"] in known or item_name(item).casefold() != title.casefold():
+                continue
+            if local_datetime(item["datetime"]) <= now:
+                continue
+            detail = api.item(item["id"])
+            if not detail.get("beginDate"):
+                continue
+            self.database.execute(
+                """INSERT OR IGNORE INTO opening_events(username,title,event_id,starts_at,opens_at,notified)
+                   VALUES(?,?,?,?,?,?)""",
+                (
+                    username,
+                    title,
+                    item["id"],
+                    item["datetime"],
+                    detail["beginDate"],
+                    int(suppress_open and registration_opened(detail, now)),
+                ),
+            )
+        self.database.commit()
+
+    def add_opening_watch(self, chat_id: int, username: str, activity_id: str) -> None:
+        api = MobiFitness(account_token(username))
+        items = api.schedule(datetime.now(MOSCOW).date(), 7)
+        selected = next((item for item in items if item.get("activity", {}).get("id") == activity_id), None)
+        if not selected:
+            raise ValueError("Этот вид занятия больше не найден в расписании.")
+        title = item_name(selected)
+        self.database.execute(
+            """INSERT INTO opening_watches(chat_id,username,activity_id,title,status)
+               VALUES(?,?,?,?,'active')
+               ON CONFLICT(username,title) DO UPDATE SET
+                   chat_id=excluded.chat_id,activity_id=excluded.activity_id,status='active'""",
+            (chat_id, username, activity_id, title),
+        )
+        self.database.commit()
+        self.sync_opening_events(username, title, api, items, suppress_open=True)
+        self.telegram.send(chat_id, f"Слежу за открытием записи: {title}")
+
     def add_watch(self, chat_id: int, username: str, item: dict) -> None:
         self.database.execute(
             """INSERT INTO watches(chat_id,username,event_id,title,starts_at,status,next_check)
@@ -295,20 +399,41 @@ class PrideBot:
         rows = self.database.execute(
             "SELECT * FROM watches WHERE username=? AND status='active' ORDER BY starts_at", (username,)
         ).fetchall()
-        keyboard = [[{"text": f"Остановить · {row['title']}"[:64], "callback_data": f"stop|{row['event_id']}"}] for row in rows]
-        self.telegram.send(chat_id, f"Активных отслеживаний: {len(rows)}", keyboard or None)
+        openings = self.database.execute(
+            "SELECT * FROM opening_watches WHERE username=? AND status='active' ORDER BY title", (username,)
+        ).fetchall()
+        keyboard = [
+            [{"text": f"Остановить место · {row['title']}"[:64], "callback_data": f"stop|{row['event_id']}"}]
+            for row in rows
+        ]
+        keyboard += [
+            [
+                {
+                    "text": f"Остановить открытия · {row['title']}"[:64],
+                    "callback_data": f"stopopening|{row['activity_id']}",
+                }
+            ]
+            for row in openings
+        ]
+        self.telegram.send(
+            chat_id,
+            f"Слежение за местами: {len(rows)}. За открытием записи: {len(openings)}.",
+            keyboard or None,
+        )
 
     def handle_message(self, message: dict) -> None:
         chat_id, username = self.user({"from": message.get("from"), "message": message})
         text = (message.get("text") or "").strip()
         if text == "/watches":
             self.watches(chat_id, username)
+        elif text == "/openings":
+            self.send_opening_categories(chat_id, username, 0)
         elif text in {"/start", "/all"}:
             self.set_query(chat_id, "")
             self.telegram.send(chat_id, f"Аккаунт @{username} подключён. Напишите часть названия занятия или выберите период.")
             self.send_ranges(chat_id)
         elif text.startswith("/"):
-            self.telegram.send(chat_id, "Команды: /start, /all, /watches")
+            self.telegram.send(chat_id, "Команды: /start, /all, /openings, /watches")
         else:
             self.set_query(chat_id, text)
             self.send_ranges(chat_id)
@@ -319,12 +444,22 @@ class PrideBot:
         action, value, *rest = callback.get("data", "").split("|")
         if action == "range":
             self.send_schedule(chat_id, username, value, int(rest[0]))
+        elif action == "openings":
+            self.send_opening_categories(chat_id, username, int(value))
+        elif action == "opening":
+            self.add_opening_watch(chat_id, username, value)
         elif action == "watch":
             self.select_event(chat_id, username, value)
         elif action == "stop":
             self.database.execute("DELETE FROM watches WHERE username=? AND event_id=?", (username, value))
             self.database.commit()
             self.telegram.send(chat_id, "Отслеживание остановлено.")
+        elif action == "stopopening":
+            self.database.execute(
+                "DELETE FROM opening_watches WHERE username=? AND activity_id=?", (username, value)
+            )
+            self.database.commit()
+            self.telegram.send(chat_id, "Слежение за открытием записи остановлено.")
 
     def check_watches(self) -> None:
         now = int(time.time())
@@ -374,11 +509,63 @@ class PrideBot:
             except Exception as error:
                 print(f"Проверка {row['event_id']}: {error}", file=sys.stderr)
 
+    def check_openings(self) -> None:
+        now_timestamp = int(time.time())
+        if now_timestamp < self.next_opening_check:
+            return
+        self.next_opening_check = now_timestamp + CHECK_INTERVAL
+        watches = self.database.execute(
+            "SELECT * FROM opening_watches WHERE status='active' ORDER BY username,title"
+        ).fetchall()
+        for username in sorted({row["username"] for row in watches}):
+            user_watches = [row for row in watches if row["username"] == username]
+            try:
+                api = MobiFitness(account_token(username))
+                items = api.schedule(datetime.now(MOSCOW).date(), 7)
+                for row in user_watches:
+                    self.sync_opening_events(username, row["title"], api, items)
+            except ApiError as error:
+                if error.status == 401:
+                    self.database.execute(
+                        "UPDATE opening_watches SET status='auth_error' WHERE username=?", (username,)
+                    )
+                    self.database.commit()
+                    for chat_id in {row["chat_id"] for row in user_watches}:
+                        self.telegram.send(chat_id, "Сессия Pride Fitness истекла. Нужна новая SMS-авторизация.")
+                else:
+                    print(f"Проверка открытий @{username}: HTTP {error.status} {error}", file=sys.stderr)
+            except Exception as error:
+                print(f"Проверка открытий @{username}: {error}", file=sys.stderr)
+
+        now = datetime.now(MOSCOW)
+        due = self.database.execute(
+            """SELECT event.*, watch.chat_id
+               FROM opening_events AS event
+               JOIN opening_watches AS watch
+                 ON watch.username=event.username AND watch.title=event.title
+               WHERE event.notified=0 AND watch.status='active'"""
+        ).fetchall()
+        weekdays = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
+        for event in due:
+            if local_datetime(event["opens_at"]) > now:
+                continue
+            starts_at = local_datetime(event["starts_at"])
+            self.telegram.send(
+                event["chat_id"],
+                f"Открылась запись: {event['title']} · {starts_at:%d.%m}, {weekdays[starts_at.weekday()]}, {starts_at:%H:%M}",
+            )
+            self.database.execute(
+                "UPDATE opening_events SET notified=1 WHERE username=? AND event_id=?",
+                (event["username"], event["event_id"]),
+            )
+            self.database.commit()
+
     def run(self) -> None:
         offset = 0
         print("Pride bot запущен", flush=True)
         while True:
             self.check_watches()
+            self.check_openings()
             try:
                 updates = self.telegram.call("getUpdates", offset=offset, timeout=25, allowed_updates=["message", "callback_query"])
                 for update in updates:

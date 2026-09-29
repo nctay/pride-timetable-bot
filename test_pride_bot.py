@@ -21,6 +21,9 @@ class PrideBotTest(unittest.TestCase):
         starts_at = "2026-09-30T20:00:00+03:00"
         self.assertFalse(pride_bot.watch_deadline_reached(starts_at, datetime.fromisoformat("2026-09-30T19:44:59+03:00")))
         self.assertTrue(pride_bot.watch_deadline_reached(starts_at, datetime.fromisoformat("2026-09-30T19:45:00+03:00")))
+        item = {"beginDate": "2026-09-29T09:00:00+03:00"}
+        self.assertFalse(pride_bot.registration_opened(item, datetime.fromisoformat("2026-09-29T08:59:59+03:00")))
+        self.assertTrue(pride_bot.registration_opened(item, datetime.fromisoformat("2026-09-29T09:00:00+03:00")))
 
 
 if __name__ == "__main__":
