@@ -230,6 +230,7 @@ RANGE_KEYBOARD = [
     [{"text": "Завтра", "callback_data": "range|tomorrow|0"}],
     [{"text": "Ближайшие 7 дней", "callback_data": "range|week|0"}],
     [{"text": "Следить за открытием записи", "callback_data": "openings|0"}],
+    [{"text": "Мои подписки", "callback_data": "subscriptions|0"}],
 ]
 
 
@@ -403,13 +404,18 @@ class PrideBot:
             "SELECT * FROM opening_watches WHERE username=? AND status='active' ORDER BY title", (username,)
         ).fetchall()
         keyboard = [
-            [{"text": f"Остановить место · {row['title']}"[:64], "callback_data": f"stop|{row['event_id']}"}]
+            [
+                {
+                    "text": f"❌ Автозапись · {item_time({'datetime': row['starts_at']})} · {row['title']}"[:64],
+                    "callback_data": f"stop|{row['event_id']}",
+                }
+            ]
             for row in rows
         ]
         keyboard += [
             [
                 {
-                    "text": f"Остановить открытия · {row['title']}"[:64],
+                    "text": f"❌ Оповещения · {row['title']}"[:64],
                     "callback_data": f"stopopening|{row['activity_id']}",
                 }
             ]
@@ -417,7 +423,10 @@ class PrideBot:
         ]
         self.telegram.send(
             chat_id,
-            f"Слежение за местами: {len(rows)}. За открытием записи: {len(openings)}.",
+            "Мои подписки\n"
+            f"Ожидание места с автозаписью: {len(rows)}\n"
+            f"Оповещения об открытии записи: {len(openings)}\n\n"
+            "Нажмите ❌, чтобы отменить подписку.",
             keyboard or None,
         )
 
@@ -448,6 +457,8 @@ class PrideBot:
             self.send_opening_categories(chat_id, username, int(value))
         elif action == "opening":
             self.add_opening_watch(chat_id, username, value)
+        elif action == "subscriptions":
+            self.watches(chat_id, username)
         elif action == "watch":
             self.select_event(chat_id, username, value)
         elif action == "stop":
