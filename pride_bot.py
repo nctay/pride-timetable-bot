@@ -147,6 +147,13 @@ def range_dates(mode: str, today: date | None = None) -> tuple[date, int]:
     raise ValueError(mode)
 
 
+def watch_deadline_reached(starts_at: str, now: datetime | None = None) -> bool:
+    start = datetime.fromisoformat(starts_at)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=MOSCOW)
+    return (now or datetime.now(MOSCOW)) >= start.astimezone(MOSCOW) - timedelta(minutes=15)
+
+
 def db() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
@@ -325,6 +332,18 @@ class PrideBot:
             "SELECT * FROM watches WHERE status='active' AND next_check<=?", (now,)
         ).fetchall()
         for row in rows:
+            if watch_deadline_reached(row["starts_at"]):
+                self.database.execute(
+                    "UPDATE watches SET status='expired' WHERE username=? AND event_id=?",
+                    (row["username"], row["event_id"]),
+                )
+                self.database.commit()
+                self.telegram.send(
+                    row["chat_id"],
+                    f"Слежение остановлено: до занятия осталось 15 минут · "
+                    f"{item_time({'datetime': row['starts_at']})} · {row['title']}",
+                )
+                continue
             self.database.execute(
                 "UPDATE watches SET next_check=? WHERE username=? AND event_id=?",
                 (now + CHECK_INTERVAL, row["username"], row["event_id"]),
@@ -435,4 +454,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
