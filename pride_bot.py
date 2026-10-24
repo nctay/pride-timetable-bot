@@ -589,31 +589,30 @@ class PrideBot:
 
     def check_openings(self) -> None:
         now_timestamp = int(time.time())
-        if now_timestamp < self.next_opening_check:
-            return
-        self.next_opening_check = now_timestamp + OPENING_CHECK_INTERVAL
-        watches = self.database.execute(
-            "SELECT * FROM opening_watches WHERE status='active' ORDER BY username,title"
-        ).fetchall()
-        for username in sorted({row["username"] for row in watches}):
-            user_watches = [row for row in watches if row["username"] == username]
-            try:
-                api = MobiFitness(account_token(username))
-                items = api.schedule(datetime.now(MOSCOW).date(), 7)
-                for row in user_watches:
-                    self.sync_opening_events(username, row["title"], api, items)
-            except ApiError as error:
-                if error.status == 401:
-                    self.database.execute(
-                        "UPDATE opening_watches SET status='auth_error' WHERE username=?", (username,)
-                    )
-                    self.database.commit()
-                    for chat_id in {row["chat_id"] for row in user_watches}:
-                        self.telegram.send(chat_id, "Сессия Pride Fitness истекла. Нужна новая SMS-авторизация.")
-                else:
-                    print(f"Проверка открытий @{username}: HTTP {error.status} {error}", file=sys.stderr)
-            except Exception as error:
-                print(f"Проверка открытий @{username}: {error}", file=sys.stderr)
+        if now_timestamp >= self.next_opening_check:
+            self.next_opening_check = now_timestamp + OPENING_CHECK_INTERVAL
+            watches = self.database.execute(
+                "SELECT * FROM opening_watches WHERE status='active' ORDER BY username,title"
+            ).fetchall()
+            for username in sorted({row["username"] for row in watches}):
+                user_watches = [row for row in watches if row["username"] == username]
+                try:
+                    api = MobiFitness(account_token(username))
+                    items = api.schedule(datetime.now(MOSCOW).date(), 7)
+                    for row in user_watches:
+                        self.sync_opening_events(username, row["title"], api, items)
+                except ApiError as error:
+                    if error.status == 401:
+                        self.database.execute(
+                            "UPDATE opening_watches SET status='auth_error' WHERE username=?", (username,)
+                        )
+                        self.database.commit()
+                        for chat_id in {row["chat_id"] for row in user_watches}:
+                            self.telegram.send(chat_id, "Сессия Pride Fitness истекла. Нужна новая SMS-авторизация.")
+                    else:
+                        print(f"Проверка открытий @{username}: HTTP {error.status} {error}", file=sys.stderr)
+                except Exception as error:
+                    print(f"Проверка открытий @{username}: {error}", file=sys.stderr)
 
         now = datetime.now(MOSCOW)
         due = self.database.execute(
@@ -625,13 +624,20 @@ class PrideBot:
         ).fetchall()
         weekdays = ("понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье")
         for event in due:
-            if local_datetime(event["opens_at"]) > now:
+            opens_at = local_datetime(event["opens_at"])
+            if opens_at - timedelta(minutes=2) > now:
                 continue
             starts_at = local_datetime(event["starts_at"])
-            self.telegram.send(
-                event["chat_id"],
-                f"Открылась запись: {event['title']} · {starts_at:%d.%m}, {weekdays[starts_at.weekday()]}, {starts_at:%H:%M}",
-            )
+            if starts_at > now:
+                message = (
+                    f"Запись откроется в {opens_at:%H:%M}:"
+                    if now < opens_at
+                    else "Открылась запись:"
+                )
+                self.telegram.send(
+                    event["chat_id"],
+                    f"{message} {event['title']} · {starts_at:%d.%m}, {weekdays[starts_at.weekday()]}, {starts_at:%H:%M}",
+                )
             self.database.execute(
                 "UPDATE opening_events SET notified=1 WHERE username=? AND event_id=?",
                 (event["username"], event["event_id"]),

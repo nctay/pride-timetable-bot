@@ -1,8 +1,10 @@
 import os
 import tempfile
+import time
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pride_bot
 
@@ -37,6 +39,56 @@ class PrideBotTest(unittest.TestCase):
         )
         self.assertTrue(all(not pride_bot.class_allowed(title) for title in excluded))
         self.assertTrue(pride_bot.class_allowed("ЙОГА (90 мин)"))
+
+    def test_opening_notification_does_not_wait_for_schedule_scan(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(pride_bot, "DB_PATH", Path(directory) / "test.db"):
+            bot = object.__new__(pride_bot.PrideBot)
+            bot.database = pride_bot.db()
+            bot.telegram = Mock()
+            bot.next_opening_check = int(time.time()) + 1800
+            now = datetime.now(pride_bot.MOSCOW)
+            bot.database.execute(
+                "INSERT INTO opening_watches(chat_id,username,activity_id,title) VALUES(?,?,?,?)",
+                (123, "annn_uu", "activity", "ЙОГА"),
+            )
+            bot.database.execute(
+                """INSERT INTO opening_events(username,title,event_id,starts_at,opens_at)
+                   VALUES(?,?,?,?,?)""",
+                (
+                    "annn_uu", "ЙОГА", "event",
+                    (now + timedelta(days=1)).isoformat(),
+                    (now + timedelta(minutes=1)).isoformat(),
+                ),
+            )
+            bot.database.execute(
+                """INSERT INTO opening_events(username,title,event_id,starts_at,opens_at)
+                   VALUES(?,?,?,?,?)""",
+                (
+                    "annn_uu", "ЙОГА", "later",
+                    (now + timedelta(days=1)).isoformat(),
+                    (now + timedelta(minutes=3)).isoformat(),
+                ),
+            )
+            bot.database.commit()
+            with patch.object(pride_bot.MobiFitness, "schedule") as schedule:
+                bot.check_openings()
+                bot.check_openings()
+                schedule.assert_not_called()
+            bot.telegram.send.assert_called_once()
+            self.assertIn("Запись откроется в", bot.telegram.send.call_args.args[1])
+            self.assertEqual(
+                dict(bot.database.execute("SELECT event_id,notified FROM opening_events")),
+                {"event": 1, "later": 0},
+            )
+            bot.database.execute(
+                "UPDATE opening_events SET opens_at=? WHERE event_id='later'",
+                ((now - timedelta(minutes=1)).isoformat(),),
+            )
+            bot.database.commit()
+            bot.check_openings()
+            self.assertEqual(bot.telegram.send.call_count, 2)
+            self.assertIn("Открылась запись", bot.telegram.send.call_args.args[1])
+            bot.database.close()
 
 
 if __name__ == "__main__":
