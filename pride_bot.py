@@ -246,6 +246,7 @@ class Telegram:
             reply_markup={
                 "keyboard": [
                     [{"text": "Расписание"}],
+                    [{"text": "Автозапись при открытии"}],
                     [{"text": "Следить за открытием записи"}],
                     [{"text": "Мои подписки"}],
                 ],
@@ -259,6 +260,7 @@ RANGE_KEYBOARD = [
     [{"text": "Сегодня", "callback_data": "range|today|0"}],
     [{"text": "Завтра", "callback_data": "range|tomorrow|0"}],
     [{"text": "Выбрать дату", "callback_data": "dates|0"}],
+    [{"text": "Автозапись при открытии", "callback_data": "bookdates|0"}],
     [{"text": "Следить за открытием записи", "callback_data": "openings|0"}],
     [{"text": "Мои подписки", "callback_data": "subscriptions|0"}],
 ]
@@ -269,7 +271,8 @@ WELCOME_TEXT = """👋 Добро пожаловать в Pride Fitness Bot!
 • посмотреть расписание на сегодня, завтра или выбранную дату в ближайшие 14 дней;
 • написать название занятия, чтобы отфильтровать расписание;
 • дождаться свободного места — бот проверяет его раз в минуту и запишет автоматически;
-• следить за открытием записи по названию занятия — проверка раз в 30 минут;
+• выбрать конкретное занятие и записаться, когда откроется запись;
+• следить за открытием записи по названию занятия;
 • посмотреть и отменить всё через «Мои подписки».
 
 Слежение за свободным местом прекращается за 15 минут до начала занятия.
@@ -312,15 +315,19 @@ class PrideBot:
         account_token(username)
         return int(chat_id), username
 
-    def send_schedule(self, chat_id: int, username: str, mode: str, page: int) -> None:
+    def send_schedule(self, chat_id: int, username: str, mode: str, page: int, book_at_open: bool = False) -> None:
         if mode in {"today", "tomorrow", "week"}:
             start, days = range_dates(mode)
             callback_action = "range"
         else:
             start, days = date.fromisoformat(mode), 1
-            callback_action = "date"
+            callback_action = "bookdate" if book_at_open else "date"
+            if book_at_open and start not in selectable_dates():
+                raise ValueError("Выберите дату в ближайшие 14 дней.")
         items = MobiFitness(account_token(username)).schedule(start, days)
         items = [item for item in items if class_allowed(item_name(item))]
+        if book_at_open:
+            items = [item for item in items if item.get("preEntry") and not watch_deadline_reached(item["datetime"])]
         query = self.query(chat_id).casefold()
         if query:
             items = [item for item in items if query in item_name(item).casefold()]
@@ -332,8 +339,11 @@ class PrideBot:
             free = slots(item)
             capacity = item.get("totalSlots")
             place = "∞" if free is None else f"{free}/{capacity or '?'}"
-            label = f"{item_time(item)} · {item_name(item)} · {place}"[:64]
-            keyboard.append([{"text": label, "callback_data": f"watch|{item['id']}"}])
+            label = f"{item_time(item)} · {item_name(item)}"
+            if not book_at_open:
+                label += f" · {place}"
+            action = "bookopen" if book_at_open else "watch"
+            keyboard.append([{"text": label[:64], "callback_data": f"{action}|{item['id']}"}])
         navigation = []
         if page:
             navigation.append({"text": "←", "callback_data": f"{callback_action}|{mode}|{page - 1}"})
@@ -344,14 +354,16 @@ class PrideBot:
         text = f"Найдено занятий: {len(items)}. Страница {page + 1}/{pages}. Выберите занятие:"
         self.telegram.send(chat_id, text if items else "Подходящих занятий нет.", keyboard or None)
 
-    def send_dates(self, chat_id: int) -> None:
+    def send_dates(self, chat_id: int, book_at_open: bool = False) -> None:
         weekdays = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+        action = "bookdate" if book_at_open else "date"
         buttons = [
-            {"text": f"{weekdays[day.weekday()]} {day:%d.%m}", "callback_data": f"date|{day.isoformat()}|0"}
+            {"text": f"{weekdays[day.weekday()]} {day:%d.%m}", "callback_data": f"{action}|{day.isoformat()}|0"}
             for day in selectable_dates()
         ]
         keyboard = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
-        self.telegram.send(chat_id, "Выберите дату в ближайшие 14 дней:", keyboard)
+        title = "Выберите дату занятия для автозаписи:" if book_at_open else "Выберите дату в ближайшие 14 дней:"
+        self.telegram.send(chat_id, title, keyboard)
 
     def opening_categories(self, username: str) -> list[tuple[str, str]]:
         items = MobiFitness(account_token(username)).schedule(datetime.now(MOSCOW).date(), 7)
@@ -430,20 +442,41 @@ class PrideBot:
         self.sync_opening_events(username, title, api, items, suppress_open=True)
         self.telegram.send(chat_id, f"Слежу за открытием записи: {title}")
 
-    def add_watch(self, chat_id: int, username: str, item: dict) -> None:
+    def add_watch(
+        self, chat_id: int, username: str, item: dict, status: str = "active", next_check: int = 0
+    ) -> None:
         self.database.execute(
             """INSERT INTO watches(chat_id,username,event_id,title,starts_at,status,next_check)
-               VALUES(?,?,?,?,?,'active',0)
-               ON CONFLICT(username,event_id) DO UPDATE SET status='active',chat_id=excluded.chat_id,next_check=0""",
-            (chat_id, username, item["id"], item_name(item), item["datetime"]),
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(username,event_id) DO UPDATE SET
+                   status=excluded.status,chat_id=excluded.chat_id,next_check=excluded.next_check,
+                   title=excluded.title,starts_at=excluded.starts_at""",
+            (chat_id, username, item["id"], item_name(item), item["datetime"], status, next_check),
         )
         self.database.commit()
 
-    def select_event(self, chat_id: int, username: str, event_id: str) -> None:
+    def select_event(self, chat_id: int, username: str, event_id: str, book_at_open: bool = False) -> None:
         api = MobiFitness(account_token(username))
         item = api.item(event_id)
+        if book_at_open and (
+            local_datetime(item["datetime"]).date() not in selectable_dates()
+            or not class_allowed(item_name(item))
+            or not item.get("preEntry")
+            or not item.get("beginDate")
+        ):
+            raise ValueError("Это занятие недоступно для автозаписи при открытии.")
         if item.get("reserved"):
             self.telegram.send(chat_id, f"Вы уже записаны: {item_time(item)} · {item_name(item)}")
+            return
+        if watch_deadline_reached(item["datetime"]):
+            raise ValueError("До начала занятия осталось меньше 15 минут.")
+        if item.get("beginDate") and not registration_opened(item):
+            opens_at = local_datetime(item["beginDate"])
+            self.add_watch(chat_id, username, item, "waiting_open", int(opens_at.timestamp()))
+            self.telegram.send(
+                chat_id,
+                f"Запишу при открытии {opens_at:%d.%m в %H:%M}: {item_time(item)} · {item_name(item)}",
+            )
             return
         if (slots(item) or 0) > 0:
             result = api.reserve(event_id)
@@ -455,7 +488,8 @@ class PrideBot:
 
     def watches(self, chat_id: int, username: str) -> None:
         rows = self.database.execute(
-            "SELECT * FROM watches WHERE username=? AND status='active' ORDER BY starts_at", (username,)
+            "SELECT * FROM watches WHERE username=? AND status IN ('active','waiting_open') ORDER BY starts_at",
+            (username,),
         ).fetchall()
         openings = self.database.execute(
             "SELECT * FROM opening_watches WHERE username=? AND status='active' ORDER BY title", (username,)
@@ -463,7 +497,10 @@ class PrideBot:
         keyboard = [
             [
                 {
-                    "text": f"❌ Автозапись · {item_time({'datetime': row['starts_at']})} · {row['title']}"[:64],
+                    "text": (
+                        f"❌ {'При открытии' if row['status'] == 'waiting_open' else 'Ожидание места'}"
+                        f" · {item_time({'datetime': row['starts_at']})} · {row['title']}"
+                    )[:64],
                     "callback_data": f"stop|{row['event_id']}",
                 }
             ]
@@ -481,7 +518,8 @@ class PrideBot:
         self.telegram.send(
             chat_id,
             "Мои подписки\n"
-            f"Ожидание места с автозаписью: {len(rows)}\n"
+            f"Автозапись при открытии: {sum(row['status'] == 'waiting_open' for row in rows)}\n"
+            f"Ожидание места: {sum(row['status'] == 'active' for row in rows)}\n"
             f"Оповещения об открытии записи: {len(openings)}\n\n"
             "Нажмите ❌, чтобы отменить подписку.",
             keyboard or None,
@@ -492,6 +530,9 @@ class PrideBot:
         text = (message.get("text") or "").strip()
         if text in {"/watches", "Мои подписки"}:
             self.watches(chat_id, username)
+        elif text in {"/bookopen", "Автозапись при открытии"}:
+            self.set_query(chat_id, "")
+            self.send_dates(chat_id, book_at_open=True)
         elif text in {"/openings", "Следить за открытием записи"}:
             self.send_opening_categories(chat_id, username, 0)
         elif text == "Расписание":
@@ -505,7 +546,7 @@ class PrideBot:
             )
             self.send_ranges(chat_id)
         elif text.startswith("/"):
-            self.telegram.send(chat_id, "Команды: /start, /all, /openings, /watches")
+            self.telegram.send(chat_id, "Команды: /start, /all, /bookopen, /openings, /watches")
         else:
             self.set_query(chat_id, text)
             self.send_ranges(chat_id)
@@ -518,8 +559,13 @@ class PrideBot:
             self.send_schedule(chat_id, username, value, int(rest[0]))
         elif action == "dates":
             self.send_dates(chat_id)
+        elif action == "bookdates":
+            self.set_query(chat_id, "")
+            self.send_dates(chat_id, book_at_open=True)
         elif action == "date":
             self.send_schedule(chat_id, username, value, int(rest[0]))
+        elif action == "bookdate":
+            self.send_schedule(chat_id, username, value, int(rest[0]), book_at_open=True)
         elif action == "openings":
             self.send_opening_categories(chat_id, username, int(value))
         elif action == "opening":
@@ -528,6 +574,8 @@ class PrideBot:
             self.watches(chat_id, username)
         elif action == "watch":
             self.select_event(chat_id, username, value)
+        elif action == "bookopen":
+            self.select_event(chat_id, username, value, book_at_open=True)
         elif action == "stop":
             self.database.execute("DELETE FROM watches WHERE username=? AND event_id=?", (username, value))
             self.database.commit()
@@ -542,7 +590,7 @@ class PrideBot:
     def check_watches(self) -> None:
         now = int(time.time())
         rows = self.database.execute(
-            "SELECT * FROM watches WHERE status='active' AND next_check<=?", (now,)
+            "SELECT * FROM watches WHERE status IN ('active','waiting_open') AND next_check<=?", (now,)
         ).fetchall()
         for row in rows:
             if watch_deadline_reached(row["starts_at"]):
@@ -565,7 +613,20 @@ class PrideBot:
             try:
                 api = MobiFitness(account_token(row["username"]))
                 item = api.item(row["event_id"])
-                if not item.get("reserved") and (slots(item) or 0) > 0:
+                already_reserved = item.get("reserved")
+                if not already_reserved and not registration_opened(item) and (
+                    row["status"] == "waiting_open" or item.get("beginDate")
+                ):
+                    next_check = int(local_datetime(item["beginDate"]).timestamp()) if item.get("beginDate") else now + CHECK_INTERVAL
+                    self.add_watch(row["chat_id"], row["username"], item, "waiting_open", next_check)
+                    continue
+                if item.get("beginDate") and 0 <= int(time.time()) - int(local_datetime(item["beginDate"]).timestamp()) < 60:
+                    self.database.execute(
+                        "UPDATE watches SET next_check=? WHERE username=? AND event_id=?",
+                        (int(time.time()) + 10, row["username"], row["event_id"]),
+                    )
+                    self.database.commit()
+                if not already_reserved and (slots(item) or 0) > 0:
                     item = api.reserve(row["event_id"])
                 if item.get("reserved"):
                     self.database.execute(
@@ -573,7 +634,19 @@ class PrideBot:
                         (row["username"], row["event_id"]),
                     )
                     self.database.commit()
-                    self.telegram.send(row["chat_id"], f"ОК, место появилось и запись выполнена: {item_time(item)} · {item_name(item)}")
+                    reason = "при открытии записи" if row["status"] == "waiting_open" else "когда появилось место"
+                    message = "Вы уже записаны" if already_reserved else f"ОК, записал {reason}"
+                    self.telegram.send(row["chat_id"], f"{message}: {item_time(item)} · {item_name(item)}")
+                elif row["status"] == "waiting_open":
+                    self.database.execute(
+                        "UPDATE watches SET status='active' WHERE username=? AND event_id=?",
+                        (row["username"], row["event_id"]),
+                    )
+                    self.database.commit()
+                    self.telegram.send(
+                        row["chat_id"],
+                        f"Запись открылась, но мест нет. Продолжаю ждать: {item_time(item)} · {item_name(item)}",
+                    )
             except ApiError as error:
                 if error.status == 401:
                     self.database.execute(
@@ -650,6 +723,7 @@ class PrideBot:
             "setMyCommands",
             commands=[
                 {"command": "start", "description": "Главное меню"},
+                {"command": "bookopen", "description": "Автозапись при открытии"},
                 {"command": "openings", "description": "Следить за открытием записи"},
                 {"command": "watches", "description": "Мои подписки"},
                 {"command": "all", "description": "Все занятия"},
@@ -661,7 +735,11 @@ class PrideBot:
             self.check_watches()
             self.check_openings()
             try:
-                updates = self.telegram.call("getUpdates", offset=offset, timeout=25, allowed_updates=["message", "callback_query"])
+                next_open = self.database.execute(
+                    "SELECT MIN(next_check) FROM watches WHERE status='waiting_open'"
+                ).fetchone()[0]
+                timeout = 25 if next_open is None else max(1, min(25, next_open - int(time.time())))
+                updates = self.telegram.call("getUpdates", offset=offset, timeout=timeout, allowed_updates=["message", "callback_query"])
                 for update in updates:
                     offset = update["update_id"] + 1
                     try:

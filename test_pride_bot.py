@@ -90,6 +90,62 @@ class PrideBotTest(unittest.TestCase):
             self.assertIn("Открылась запись", bot.telegram.send.call_args.args[1])
             bot.database.close()
 
+    def test_booking_waits_for_selected_class_opening(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(pride_bot, "DB_PATH", Path(directory) / "test.db"):
+            bot = object.__new__(pride_bot.PrideBot)
+            bot.database = pride_bot.db()
+            bot.telegram = Mock()
+            now = datetime.now(pride_bot.MOSCOW)
+            opening = now + timedelta(minutes=10)
+            item = {
+                "id": "chosen-event",
+                "datetime": (now + timedelta(days=1)).isoformat(),
+                "beginDate": opening.isoformat(),
+                "activity": {"title": "ЙОГА"},
+                "preEntry": True,
+                "bookingOpened": True,
+                "availableSlots": "5",
+                "reserved": False,
+            }
+            api = Mock()
+            api.item.return_value = item
+            api.schedule.return_value = [item]
+            api.reserve.return_value = {**item, "reserved": True}
+            with patch.object(pride_bot, "account_token", return_value="token"), patch.object(
+                pride_bot, "MobiFitness", return_value=api
+            ):
+                bot.send_dates(123, book_at_open=True)
+                self.assertTrue(bot.telegram.send.call_args.args[2][0][0]["callback_data"].startswith("bookdate|"))
+                day = pride_bot.local_datetime(item["datetime"]).date()
+                bot.send_schedule(123, "annn_uu", day.isoformat(), 0, book_at_open=True)
+                api.schedule.assert_called_once_with(day, 1)
+                self.assertEqual(bot.telegram.send.call_args.args[2][0][0]["callback_data"], "bookopen|chosen-event")
+                bot.select_event(123, "annn_uu", "chosen-event", book_at_open=True)
+                api.reserve.assert_not_called()
+                row = bot.database.execute("SELECT status,next_check FROM watches").fetchone()
+                self.assertEqual((row["status"], row["next_check"]), ("waiting_open", int(opening.timestamp())))
+                bot.watches(123, "annn_uu")
+                self.assertEqual(bot.telegram.send.call_args.args[2][0][0]["callback_data"], "stop|chosen-event")
+                bot.check_watches()
+                api.reserve.assert_not_called()
+                item["beginDate"] = (now - timedelta(minutes=1)).isoformat()
+                bot.database.execute("UPDATE watches SET next_check=0")
+                bot.database.commit()
+                bot.check_watches()
+                api.reserve.assert_called_once_with("chosen-event")
+                self.assertEqual(bot.database.execute("SELECT status FROM watches").fetchone()[0], "booked")
+                api.reserve.reset_mock()
+                item["availableSlots"] = "0"
+                item["beginDate"] = (now - timedelta(seconds=10)).isoformat()
+                bot.database.execute("UPDATE watches SET status='waiting_open',next_check=0")
+                bot.database.commit()
+                bot.check_watches()
+                api.reserve.assert_not_called()
+                row = bot.database.execute("SELECT status,next_check FROM watches").fetchone()
+                self.assertEqual(row["status"], "active")
+                self.assertLessEqual(row["next_check"] - int(time.time()), 10)
+            bot.database.close()
+
 
 if __name__ == "__main__":
     unittest.main()
